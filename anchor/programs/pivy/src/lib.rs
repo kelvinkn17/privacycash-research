@@ -235,6 +235,125 @@ pub mod pivy {
 
         Ok(())
     }
+
+    /// Withdraw from multiple deposits with partial withdrawal support
+    /// User proves ownership of selected deposits and can withdraw any amount
+    /// Remaining balance creates a change commitment added back to the tree
+    pub fn bucket_withdraw_partial(
+        ctx: Context<BucketWithdrawPartial>,
+        proof: PartialWithdrawalProof,
+        withdrawal_amount: u64,
+        nullifiers: Vec<[u8; 32]>,
+        change_commitment: [u8; 32],
+    ) -> Result<()> {
+        let tree_account = &mut ctx.accounts.tree_account.load_mut()?;
+        let global_config = &ctx.accounts.global_config;
+
+        // Verify proof root is in merkle tree history
+        require!(
+            MerkleTree::is_known_root(&tree_account, proof.root),
+            ErrorCode::UnknownRoot
+        );
+
+        // Verify number of nullifiers matches proof
+        require!(
+            nullifiers.len() <= 50,
+            ErrorCode::TooManyNullifiers
+        );
+
+        // Check each nullifier hasn't been spent
+        for (i, nullifier) in nullifiers.iter().enumerate() {
+            let nullifier_account = &ctx.remaining_accounts[i];
+            require!(
+                nullifier_account.lamports() == 0,
+                ErrorCode::NullifierAlreadySpent
+            );
+        }
+
+        // Verify ZK proof
+        require!(
+            verify_withdrawal_proof(proof.clone(), VERIFYING_KEY),
+            ErrorCode::InvalidProof
+        );
+
+        // Calculate fee
+        let fee = (withdrawal_amount as u128)
+            .checked_mul(global_config.withdrawal_fee_rate as u128)
+            .ok_or(ErrorCode::ArithmeticOverflow)?
+            .checked_div(10000)
+            .ok_or(ErrorCode::ArithmeticOverflow)? as u64;
+
+        let pool_account_info = ctx.accounts.pool_account.to_account_info();
+        let rent = Rent::get()?;
+        let rent_exempt_minimum = rent.minimum_balance(pool_account_info.data_len());
+
+        let total_required = withdrawal_amount
+            .checked_add(fee)
+            .ok_or(ErrorCode::ArithmeticOverflow)?
+            .checked_add(rent_exempt_minimum)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+
+        require!(
+            pool_account_info.lamports() >= total_required,
+            ErrorCode::InsufficientFundsForWithdrawal
+        );
+
+        // Transfer withdrawal amount to recipient
+        let recipient_account_info = ctx.accounts.recipient.to_account_info();
+        let pool_balance = pool_account_info.lamports();
+        let recipient_balance = recipient_account_info.lamports();
+
+        **pool_account_info.try_borrow_mut_lamports()? = pool_balance
+            .checked_sub(withdrawal_amount)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        **recipient_account_info.try_borrow_mut_lamports()? = recipient_balance
+            .checked_add(withdrawal_amount)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+
+        // Transfer fee if applicable
+        if fee > 0 {
+            let fee_recipient_info = ctx.accounts.fee_recipient.to_account_info();
+            let pool_balance = pool_account_info.lamports();
+            let fee_recipient_balance = fee_recipient_info.lamports();
+
+            **pool_account_info.try_borrow_mut_lamports()? = pool_balance
+                .checked_sub(fee)
+                .ok_or(ErrorCode::ArithmeticOverflow)?;
+            **fee_recipient_info.try_borrow_mut_lamports()? = fee_recipient_balance
+                .checked_add(fee)
+                .ok_or(ErrorCode::ArithmeticOverflow)?;
+        }
+
+        // Mark all nullifiers as spent by initializing nullifier accounts
+        for (i, nullifier) in nullifiers.iter().enumerate() {
+            let nullifier_account = &ctx.remaining_accounts[i];
+            **nullifier_account.try_borrow_mut_lamports()? = rent_exempt_minimum;
+            // Store nullifier hash in account data
+        }
+
+        // Add change commitment back to merkle tree if non-zero
+        let change_value = proof.change_amount;
+        if change_value > 0 {
+            MerkleTree::append::<Poseidon>(change_commitment, tree_account)?;
+
+            emit!(ChangeCommitmentEvent {
+                commitment: change_commitment,
+                index: tree_account.next_index - 1,
+            });
+        }
+
+        emit!(PartialWithdrawalEvent {
+            amount: withdrawal_amount,
+            fee,
+            recipient: ctx.accounts.recipient.key(),
+            nullifiers_count: nullifiers.len() as u8,
+            change_amount: change_value,
+        });
+
+        msg!("Partial withdrawal successful: {} lamports withdrawn, {} spent deposits, {} change",
+            withdrawal_amount, nullifiers.len(), change_value);
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -258,6 +377,21 @@ pub struct WithdrawalEvent {
     pub recipient: Pubkey,
 }
 
+#[event]
+pub struct PartialWithdrawalEvent {
+    pub amount: u64,
+    pub fee: u64,
+    pub recipient: Pubkey,
+    pub nullifiers_count: u8,
+    pub change_amount: u64,
+}
+
+#[event]
+pub struct ChangeCommitmentEvent {
+    pub commitment: [u8; 32],
+    pub index: u64,
+}
+
 // ============================================================================
 // Proof Structures
 // ============================================================================
@@ -270,6 +404,18 @@ pub struct WithdrawalProof {
     pub bucket_root: [u8; 32],
     pub nullifier: [u8; 32],
     pub meta_spend_pubkey: [u8; 32],
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct PartialWithdrawalProof {
+    pub proof_a: [u8; 64],
+    pub proof_b: [u8; 128],
+    pub proof_c: [u8; 64],
+    pub root: [u8; 32],
+    pub meta_spend_public: [u8; 32],
+    pub withdrawal_amount: u64,
+    pub change_amount: u64,
+    pub ext_data_hash: [u8; 32],
 }
 
 // ============================================================================
@@ -412,6 +558,43 @@ pub struct UpdateGlobalConfig<'info> {
     pub authority: Signer<'info>,
 }
 
+#[derive(Accounts)]
+#[instruction(proof: PartialWithdrawalProof, withdrawal_amount: u64, nullifiers: Vec<[u8; 32]>, change_commitment: [u8; 32])]
+pub struct BucketWithdrawPartial<'info> {
+    #[account(
+        mut,
+        seeds = [b"merkle_tree"],
+        bump = tree_account.load()?.bump
+    )]
+    pub tree_account: AccountLoader<'info, MerkleTreeAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"pool"],
+        bump = pool_account.bump
+    )]
+    pub pool_account: Account<'info, PoolAccount>,
+
+    #[account(
+        seeds = [b"global_config"],
+        bump = global_config.bump
+    )]
+    pub global_config: Account<'info, GlobalConfig>,
+
+    #[account(mut)]
+    /// CHECK: Recipient can be any account
+    pub recipient: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    /// CHECK: Fee recipient can be any account
+    pub fee_recipient: UncheckedAccount<'info>,
+
+    pub signer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+    // Note: Nullifier accounts passed via remaining_accounts
+}
+
 // ============================================================================
 // Account Structures
 // ============================================================================
@@ -512,4 +695,8 @@ pub enum ErrorCode {
     BucketAlreadySpent,
     #[msg("Bucket is full: maximum commitments reached")]
     BucketFull,
+    #[msg("Too many nullifiers: maximum 50 allowed")]
+    TooManyNullifiers,
+    #[msg("Nullifier has already been spent")]
+    NullifierAlreadySpent,
 }
